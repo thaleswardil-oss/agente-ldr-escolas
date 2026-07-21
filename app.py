@@ -4,6 +4,7 @@ import google.generativeai as genai
 from supabase import create_client
 import time
 import json
+import re
 
 # --- CONFIGURAÇÃO VISUAL ---
 st.set_page_config(page_title="Agente LDR Proesc", layout="wide")
@@ -32,39 +33,53 @@ try:
 except Exception as e:
     st.error(f"Erro de conexão: {e}")
 
-# --- FUNÇÃO DE PESQUISA (PROMPT ESTILO LOVABLE/BDR) ---
+# --- FUNÇÃO DE PESQUISA (MAPEAMENTO COMPLETO) ---
 def enriquecer_escola(nome, cidade, uf, endereco, tel_inep):
     prompt = f"""
-    Você é um especialista em inteligência de mercado educacional.
-    PESQUISE NO GOOGLE A ESCOLA: {nome} em {cidade}-{uf}.
+    Como um Agente de Inteligência Comercial (LDR), realize uma busca profunda na internet sobre a escola abaixo.
     
-    DADOS ORIGINAIS:
-    Endereço: {endereco}
-    Telefone INEP: {tel_inep}
+    ESCOLA: {nome}
+    LOCAL: {cidade} - {uf}
+    ENDEREÇO CONHECIDO: {endereco}
+    TELEFONE INEP: {tel_inep}
 
-    REQUISITOS DE EXTRAÇÃO:
-    1. CNPJ e Razão Social exata.
-    2. Diretor/Responsável (se achar no QSA, indique).
-    3. Identifique o SGE (Ex: Proesc, Sophia, Totvs, WPensar, RM, Lyceum).
-    4. Identifique a Agenda Digital (Ex: Agenda Edu, ClassApp, ClipEscola).
-    5. E-mail de contato e Site.
-    6. Observação comercial curta para o BDR.
+    VOCÊ DEVE RETORNAR OS SEGUINTES CAMPOS OBRIGATORIAMENTE:
+    1. cnpj: Busque pelo nome + município.
+    2. razao_social: Conforme cadastrado na Receita Federal.
+    3. diretor: Identifique o sócio-administrador ou responsável pedagógico (consulte o QSA).
+    4. telefone_alternativo: Um número de telefone diferente de {tel_inep}.
+    5. email: E-mail da secretaria, financeiro ou direção.
+    6. sge_atual: Identifique se usam softwares como Sophia, Totvs, Escola Web, SAGEx, Proesc, WPensar, etc.
+    7. agenda_digital: Identifique se usam ClassApp, Agenda Edu, ClipEscola, Google Agenda ou comunicadores próprios.
+    8. site: URL oficial.
+    9. observacoes: Uma frase curta e relevante para o BDR usar na prospecção.
 
-    Responda APENAS em JSON puro com as chaves:
-    cnpj, razao_social, diretor, telefone_alternativo, email, sge_atual, agenda_digital, site, observacoes.
-    Use "Não identificado" se não encontrar.
+    REGRAS CRÍTICAS:
+    - Se não encontrar um dado, preencha o campo estritamente com "Não identificado".
+    - Nunca deixe campos vazios ou nulos.
+    - Responda apenas o JSON puro, sem textos explicativos.
     """
+    
     try:
         response = model.generate_content(prompt)
-        txt = response.text.replace('```json', '').replace('```', '').strip()
-        return json.loads(txt), response.candidates[0].grounding_metadata.search_entry_point.rendered_content if hasattr(response.candidates[0], 'grounding_metadata') else ""
-    except:
-        return None, ""
+        # Limpador de JSON robusto
+        json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
+        if json_match:
+            dados = json.loads(json_match.group())
+            # Garante que todos os campos existem no dicionário
+            campos_obrigatorios = ['cnpj', 'razao_social', 'diretor', 'telefone_alternativo', 'email', 'sge_atual', 'agenda_digital', 'site', 'observacoes']
+            for campo in campos_obrigatorios:
+                if campo not in dados or not dados[campo]:
+                    dados[campo] = "Não identificado"
+            return dados
+        return None
+    except Exception as e:
+        return None
 
 # --- INTERFACE ---
 st.title("🌿 Agente LDR - Inteligência Comercial")
 
-user_email = st.sidebar.text_input("Seu e-mail:", value="thales@proesc.com")
+user_email = st.sidebar.text_input("E-mail de acesso:", value="thales@proesc.com")
 if not user_email:
     st.info("👈 Informe seu e-mail para começar.")
     st.stop()
@@ -72,9 +87,8 @@ if not user_email:
 tab1, tab2, tab3, tab4 = st.tabs(["📂 1. Upload", "🎯 2. Filtros", "🚀 3. Processar", "📜 4. Histórico"])
 
 with tab1:
-    file = st.file_uploader("Subir Planilha INEP (Colunas A-O)", type="xlsx")
+    file = st.file_uploader("Subir Planilha INEP", type="xlsx")
     if file:
-        # Lendo sem cabeçalho para garantir os índices
         df_raw = pd.read_excel(file)
         st.session_state['df_raw'] = df_raw
         st.success(f"Carregado: {len(df_raw)} escolas.")
@@ -82,18 +96,13 @@ with tab1:
 with tab2:
     if 'df_raw' in st.session_state:
         df = st.session_state['df_raw']
-        
-        # MAPEAMENTO FIXO PELO PADRÃO INEP QUE VOCÊ PASSOU:
-        # A:0(Status), B:1(Nome), D:3(UF), E:4(Mun), H:7(End), I:8(Tel), M:12(Porte), O:14(CRM)
-        
         st.subheader("Configuração de Remessa")
         
-        # Filtro CRM Automático (Coluna O / Índice 14)
-        col_crm_idx = 14
-        if len(df.columns) > col_crm_idx:
+        # Filtro CRM (Coluna O / Índice 14)
+        if len(df.columns) > 14:
             antes = len(df)
-            df = df[~df.iloc[:, col_crm_idx].astype(str).str.lower().str.contains('sim|yes|true|1', na=False)].copy()
-            st.warning(f"💡 {antes - len(df)} escolas removidas (já estão no CRM).")
+            df = df[~df.iloc[:, 14].astype(str).str.lower().str.contains('sim|yes|true|1', na=False)].copy()
+            st.warning(f"💡 {antes - len(df)} escolas removidas (já no CRM).")
 
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -107,11 +116,9 @@ with tab2:
         with c3:
             limite = st.number_input("Qtd. Leads", 1, 500, 10)
 
-        # Aplicar Filtros
         if f_uf != "Todos": df = df[df.iloc[:, uf_col].astype(str) == f_uf]
         if f_porte != "Todos": df = df[df.iloc[:, porte_col].astype(str) == f_porte]
         df_final = df.head(limite)
-        
         st.session_state['df_final'] = df_final
         st.metric("Prontas para Enriquecer", len(df_final))
     else:
@@ -120,9 +127,9 @@ with tab2:
 with tab3:
     if 'df_final' in st.session_state:
         dff = st.session_state['df_final']
-        if st.button("🚀 INICIAR PROCESSO"):
+        if st.button("🚀 INICIAR ENRIQUECIMENTO"):
             res_rodada = supabase.table("rodadas").insert({
-                "nome_arquivo": "Remessa LDR", "total_leads": len(dff), "usuario_email": user_email
+                "nome_arquivo": "Remessa Enriquecida", "total_leads": len(dff), "usuario_email": user_email
             }).execute()
             rid = res_rodada.data[0]['id']
             
@@ -130,33 +137,41 @@ with tab3:
             status_log = st.empty()
             
             for i, (idx, row) in enumerate(dff.iterrows()):
-                # Pegando dados pelos índices exatos da sua lista
                 nome = str(row.iloc[1]) # Coluna B
                 uf = str(row.iloc[3])   # Coluna D
                 mun = str(row.iloc[4])  # Coluna E
                 end = str(row.iloc[7])  # Coluna H
                 tel = str(row.iloc[8])  # Coluna I
                 
-                status_log.text(f"Enriquecendo ({i+1}/{len(dff)}): {nome}")
+                status_log.text(f"Pesquisando ({i+1}/{len(dff)}): {nome}")
                 
-                res, fonte_html = enriquecer_escola(nome, mun, uf, end, tel)
+                res = enriquecer_escola(nome, mun, uf, end, tel)
                 
-                # Dados para salvar (Garante que os dados originais do INEP fiquem salvos)
+                # Montagem do registro para o banco
                 dados_save = {
                     "rodada_id": rid,
                     "nome_escola": nome,
                     "municipio": mun,
                     "uf": uf,
                     "telefone_inep": tel,
-                    "status": "Completa" if res else "Sem dados",
-                    "fontes": [fonte_html] if fonte_html else []
+                    "status": "Completa" if res else "Erro na busca",
+                    "cnpj": "Não identificado",
+                    "razao_social": "Não identificado",
+                    "diretor": "Não identificado",
+                    "email": "Não identificado",
+                    "site": "Não identificado",
+                    "sge_atual": "Não identificado",
+                    "agenda_digital": "Não identificado",
+                    "observacoes": "Não identificado"
                 }
-                if res: dados_save.update(res)
+                
+                if res:
+                    dados_save.update(res)
                 
                 supabase.table("leads_enriquecidos").insert(dados_save).execute()
                 barra.progress((i + 1) / len(dff))
             
-            st.success("✅ Finalizado! Veja na aba Histórico.")
+            st.success("✅ Processo Finalizado!")
     else:
         st.write("Aguardando filtros...")
 
@@ -168,7 +183,7 @@ with tab4:
             leads = supabase.table("leads_enriquecidos").select("*").eq("rodada_id", r['id']).execute()
             if leads.data:
                 res_df = pd.DataFrame(leads.data)
-                # Reorganizar colunas para ficar igual ao seu print antigo
                 cols_order = ['nome_escola', 'municipio', 'uf', 'telefone_inep', 'cnpj', 'razao_social', 'diretor', 'email', 'site', 'sge_atual', 'agenda_digital', 'observacoes']
                 st.dataframe(res_df[[c for c in cols_order if c in res_df.columns]])
-                st.download_button("📥 Baixar CSV", res_df.to_csv(index=False).encode('utf-8'), f"leads_{r['id']}.csv")
+                csv = res_df.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Baixar CSV", csv, f"leads_{r['id']}.csv")
