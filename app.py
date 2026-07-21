@@ -4,14 +4,16 @@ import google.generativeai as genai
 from supabase import create_client
 import time
 import json
+import re
 
 # --- CONFIGURAÇÃO VISUAL ---
-st.set_page_config(page_title="Agente LDR Pipeline", layout="wide")
+st.set_page_config(page_title="Agente LDR Proesc v4", layout="wide")
 st.markdown("""
     <style>
-    h1, h2, h3, p, label { color: #004225 !important; }
-    .stButton>button { background-color: #004225 !important; color: white !important; font-weight: bold; }
-    .stMetric { background-color: #f0f9eb; padding: 10px; border-radius: 10px; border: 1px solid #64CD32; }
+    h1, h2, h3, p { color: #004225 !important; }
+    .stButton>button { background-color: #004225 !important; color: white !important; font-weight: bold; height: 3em; border-radius: 10px; }
+    .stMetric { background-color: #f0f9eb; padding: 15px; border-radius: 10px; border: 1px solid #64CD32; }
+    [data-testid="stExpander"] { border: 1px solid #64CD32; border-radius: 10px; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -19,94 +21,98 @@ st.markdown("""
 try:
     supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    
-    # Modelos: Flash para busca rápida, Pro para extração densa
+    # Flash para busca (rápido), Pro para interpretação (inteligente)
     model_flash = genai.GenerativeModel('gemini-1.5-flash', tools=[{"google_search_retrieval": {}}])
     model_pro = genai.GenerativeModel('gemini-1.5-pro')
 except Exception as e:
-    st.error(f"Erro de configuração: {e}")
+    st.error(f"Erro de conexão: {e}")
 
-# --- PIPELINE DE ENRIQUECIMENTO (3 ETAPAS) ---
+# --- LOGICA DE PESOS E STATUS ---
+PESOS = {
+    "diretor": 25,
+    "sge_atual": 25,
+    "agenda_digital": 20,
+    "telefone_alternativo": 15,
+    "cnpj": 5,
+    "email": 5,
+    "site": 5
+}
 
-def pipeline_enriquecimento(escola_nome, cidade, uf, endereco):
-    # ETAPA 1: DESCOBERTA DE FONTES (Grounding)
-    prompt_busca = f"Localize o site oficial, Instagram e página de transparência da escola {escola_nome} em {cidade}-{uf}. Retorne os links encontrados."
+def calcular_score_proesc(dados):
+    score = 0
+    for campo, peso in PESOS.items():
+        valor = dados.get(campo, "")
+        if valor and valor != "Não identificado" and valor != "null":
+            score += peso
     
+    # Status baseado em Negócio (Proesc)
+    # Requisito para "Completa": Ter Diretor OU Telefone + Ter SGE ou Agenda
+    tem_decisor = (dados.get("diretor") != "Não identificado" or dados.get("telefone_alternativo") != "Não identificado")
+    tem_tech = (dados.get("sge_atual") != "Não identificado" or dados.get("agenda_digital") != "Não identificado")
+    
+    if tem_decisor and tem_tech: status = "💎 Completa (Pronta p/ BDR)"
+    elif tem_decisor or tem_tech: status = "🟡 Parcial"
+    else: status = "⚪ Sem Dados Relevantes"
+    
+    return score, status
+
+# --- PIPELINE DE ENRIQUECIMENTO ---
+
+def normalizar_nome(nome):
+    """Limpa apenas espaços e caracteres inúteis, mantendo siglas (SESI, COC, etc)"""
+    return re.sub(r"\s+", " ", str(nome).strip())
+
+def pipeline_ldr(nome, mun, uf):
+    # ETAPA 1: DESCOBERTA (Busca os Links Reais)
+    prompt_1 = f"Localize o site oficial, Instagram e dados de registro da escola {nome} em {mun}-{uf}."
     try:
-        search_res = model_flash.generate_content(prompt_busca)
-        fontes = search_res.text
+        res_1 = model_flash.generate_content(prompt_1)
+        # Extraímos os metadados brutos (evidências do Google)
+        evidencias = res_1.text
         links = []
-        if hasattr(search_res.candidates[0], 'grounding_metadata'):
-            metadata = search_res.candidates[0].grounding_metadata
+        if hasattr(res_1.candidates[0], 'grounding_metadata'):
+            metadata = res_1.candidates[0].grounding_metadata
             if hasattr(metadata, 'search_entry_point'):
                 links.append(metadata.search_entry_point.rendered_content)
     except:
-        fontes = "Busca falhou"
-        links = []
+        return None
 
-    # ETAPA 2: EXTRAÇÃO DE IDENTIDADE (CNPJ, RAZÃO, DIRETOR)
-    # Aqui usamos JSON Estruturado para garantir que o código não quebre
-    prompt_identidade = f"""
-    Com base nestas informações de busca: {fontes}
-    Extraia os dados da escola: {escola_nome}, {cidade}-{uf}.
-    Retorne APENAS um JSON com: cnpj, razao_social, diretor, email, site, telefone_alternativo.
-    Se não encontrar, use "Não identificado".
+    # ETAPA 2: EXTRAÇÃO E INTERPRETAÇÃO (A IA analisa o que o Google achou)
+    prompt_2 = f"""
+    Analise estas evidências brutas: {evidencias}
+    Sobre a escola: {nome}.
+    Extraia EXCLUSIVAMENTE em JSON:
+    - cnpj
+    - razao_social
+    - diretor (Procure no QSA ou páginas institucional)
+    - telefone_alternativo (Um contato diferente do padrão)
+    - email
+    - site
+    - sge_atual (Ex: Proesc, Sophia, Totvs, WPensar)
+    - agenda_digital (Ex: ClassApp, Agenda Edu)
+    - observacoes (Resumo técnico para abordagem de vendas)
+    
+    Regra: Use "Não identificado" se não houver evidência clara.
     """
     
     try:
-        # Forçamos o Gemini a responder em JSON puro
-        res_id = model_pro.generate_content(
-            prompt_identidade, 
-            generation_config={"response_mime_type": "application/json"}
-        )
-        dados_id = json.loads(res_id.text)
+        res_2 = model_pro.generate_content(prompt_2, generation_config={"response_mime_type": "application/json"})
+        dados = json.loads(res_2.text)
+        dados["fontes"] = links
+        return dados
     except:
-        dados_id = {}
+        return None
 
-    # ETAPA 3: DETECÇÃO DE TECNOLOGIA (SGE E AGENDA)
-    prompt_tech = f"""
-    Analise os sinais digitais da escola {escola_nome} ({fontes}).
-    Identifique especificamente:
-    1. SGE (Software de Gestão): Procure por nomes como Proesc, Totvs, Sophia, WPensar, Escola Web, SAGEx, RM, Lyceum.
-    2. Agenda Digital: Procure por ClassApp, Agenda Edu, ClipEscola, Google Agenda.
-    3. Crie uma frase comercial para abordagem.
-    Retorne APENAS um JSON com: sge_atual, agenda_digital, observacoes.
-    """
-    
-    try:
-        res_tech = model_pro.generate_content(
-            prompt_tech,
-            generation_config={"response_mime_type": "application/json"}
-        )
-        dados_tech = json.loads(res_tech.text)
-    except:
-        dados_tech = {}
+# --- INTERFACE STREAMLIT ---
+st.title("🌿 Agente LDR Enterprise - Proesc v4")
 
-    # CONSOLIDAÇÃO FINAL
-    resultado = {
-        "cnpj": dados_id.get("cnpj", "Não identificado"),
-        "razao_social": dados_id.get("razao_social", "Não identificado"),
-        "diretor": dados_id.get("diretor", "Não identificado"),
-        "email": dados_id.get("email", "Não identificado"),
-        "site": dados_id.get("site", "Não identificado"),
-        "telefone_alternativo": dados_id.get("telefone_alternativo", "Não identificado"),
-        "sge_atual": dados_tech.get("sge_atual", "Não identificado"),
-        "agenda_digital": dados_tech.get("agenda_digital", "Não identificado"),
-        "observacoes": dados_tech.get("observacoes", "Não identificado"),
-        "fontes": links
-    }
-    return resultado
-
-# --- INTERFACE ---
-st.title("🌿 Agente LDR Pipeline - Proesc")
-
-user_email = st.sidebar.text_input("E-mail:", value="thales@proesc.com")
+user_email = st.sidebar.text_input("E-mail BDR:", value="thales@proesc.com")
 if not user_email: st.stop()
 
-tab1, tab2, tab3, tab4 = st.tabs(["📂 1. Upload", "🎯 2. Filtros", "🚀 3. Processar", "📜 4. Histórico"])
+tab1, tab2, tab3, tab4 = st.tabs(["📂 Upload", "🎯 Filtros", "🚀 Processar", "📜 Auditoria"])
 
 with tab1:
-    file = st.file_uploader("Subir Planilha INEP", type="xlsx")
+    file = st.file_uploader("Arraste sua planilha INEP aqui", type="xlsx")
     if file:
         st.session_state['df_raw'] = pd.read_excel(file)
         st.success("Planilha carregada!")
@@ -114,57 +120,67 @@ with tab1:
 with tab2:
     if 'df_raw' in st.session_state:
         df = st.session_state['df_raw']
-        # Filtro CRM (Índice 14 / Coluna O)
+        # Limpeza CRM (Coluna O / 14)
         if len(df.columns) > 14:
             df = df[~df.iloc[:, 14].astype(str).str.lower().str.contains('sim|yes|true|1', na=False)].copy()
         
         c1, c2, c3 = st.columns(3)
-        with c1:
-            f_uf = st.selectbox("UF", ["Todos"] + sorted([str(x) for x in df.iloc[:, 3].unique()]))
-        with c2:
-            f_porte = st.selectbox("Porte", ["Todos"] + sorted([str(x) for x in df.iloc[:, 12].unique()]))
-        with c3:
-            limite = st.number_input("Qtd", 1, 50, 3)
+        with c1: f_uf = st.selectbox("UF", ["Todos"] + sorted([str(x) for x in df.iloc[:, 3].unique()]))
+        with c2: f_porte = st.selectbox("Porte", ["Todos"] + sorted([str(x) for x in df.iloc[:, 12].unique()]))
+        with c3: limite = st.number_input("Tamanho do Lote", 1, 100, 3)
 
         if f_uf != "Todos": df = df[df.iloc[:, 3].astype(str) == f_uf]
         if f_porte != "Todos": df = df[df.iloc[:, 12].astype(str) == f_porte]
         st.session_state['df_final'] = df.head(limite)
-        st.metric("Selecionadas", len(st.session_state['df_final']))
+        st.metric("Escolas prontas", len(st.session_state['df_final']))
 
 with tab3:
     if 'df_final' in st.session_state:
-        dff = st.session_state['df_final']
-        if st.button("🚀 INICIAR PIPELINE DE ENRIQUECIMENTO"):
-            res_rodada = supabase.table("rodadas").insert({"nome_arquivo": "Pipeline LDR", "total_leads": len(dff), "usuario_email": user_email}).execute()
-            rid = res_rodada.data[0]['id']
+        df_p = st.session_state['df_final']
+        if st.button("🚀 INICIAR CICLO DE INTELIGÊNCIA"):
+            # Criar Rodada
+            rodada = supabase.table("rodadas").insert({"nome_arquivo": "Remessa v4", "total_leads": len(df_p), "usuario_email": user_email}).execute()
+            rid = rodada.data[0]['id']
             
-            barra = st.progress(0)
+            prog = st.progress(0)
             status_txt = st.empty()
             
-            for i, (idx, row) in enumerate(dff.iterrows()):
-                nome, uf, mun, end = str(row.iloc[1]), str(row.iloc[3]), str(row.iloc[4]), str(row.iloc[7])
-                status_txt.text(f"📍 Fase {i+1}/{len(dff)}: Processando {nome}")
+            for i, (idx, row) in enumerate(df_p.iterrows()):
+                nome_original = str(row.iloc[1])
+                nome_clean = normalizar_nome(nome_original)
+                mun, uf = str(row.iloc[4]), str(row.iloc[3])
                 
-                # EXECUÇÃO DO PIPELINE
-                res = pipeline_enriquecimento(nome, mun, uf, end)
+                status_txt.info(f"Analisando evidências de: **{nome_clean}** ({i+1}/{len(df_p)})")
                 
-                # SALVAMENTO
-                dados_save = {
-                    "rodada_id": rid, "nome_escola": nome, "municipio": mun, "uf": uf, "telefone_inep": str(row.iloc[8]),
-                    "status": "Completa", **res
-                }
-                supabase.table("leads_enriquecidos").insert(dados_save).execute()
-                barra.progress((i + 1) / len(dff))
+                # Executar Pipeline
+                resultado = pipeline_ldr(nome_clean, mun, uf)
+                
+                if resultado:
+                    score, status = calcular_score_proesc(resultado)
+                    dados_supabase = {
+                        "rodada_id": rid, "nome_escola": nome_clean, "municipio": mun, "uf": uf,
+                        "telefone_inep": str(row.iloc[8]), "status": status, "confianca": score,
+                        **resultado
+                    }
+                else:
+                    dados_supabase = {
+                        "rodada_id": rid, "nome_escola": nome_clean, "status": "Erro na Busca", "confianca": 0
+                    }
+                
+                supabase.table("leads_enriquecidos").insert(dados_supabase).execute()
+                prog.progress((i + 1) / len(df_p))
                 time.sleep(1)
             
-            st.success("✅ Ciclo de Enriquecimento Finalizado!")
+            st.success("✅ Rodada finalizada com sucesso!")
 
 with tab4:
     rodadas = supabase.table("rodadas").select("*").eq("usuario_email", user_email).order("created_at", desc=True).execute()
     for r in rodadas.data:
-        with st.expander(f"📁 {r['created_at'][:16]} - {r['total_leads']} leads"):
-            leads = supabase.table("leads_enriquecidos").select("*").eq("rodada_id", r['id']).execute()
+        with st.expander(f"📁 {r['created_at'][:16]} | {r['total_leads']} leads"):
+            leads = supabase.table("leads_enriquecidos").select("*").eq("rodada_id", r['id']).order("confianca", desc=True).execute()
             if leads.data:
                 res_df = pd.DataFrame(leads.data)
-                cols = ['nome_escola', 'municipio', 'uf', 'telefone_inep', 'telefone_alternativo', 'cnpj', 'razao_social', 'diretor', 'email', 'site', 'sge_atual', 'agenda_digital', 'observacoes']
-                st.dataframe(res_df[[c for c in cols if c in res_df.columns]])
+                # Ordenar por valor comercial
+                cols = ['confianca', 'status', 'nome_escola', 'sge_atual', 'agenda_digital', 'diretor', 'telefone_alternativo', 'email', 'site']
+                st.dataframe(res_df[cols])
+                st.download_button("📥 Baixar Planilha BDR", res_df.to_csv(index=False).encode('utf-8'), f"ldr_{r['id']}.csv")
