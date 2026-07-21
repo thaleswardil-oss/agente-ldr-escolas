@@ -21,7 +21,6 @@ st.markdown("""
 try:
     supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    # Flash para busca (rápido), Pro para interpretação (inteligente)
     model_flash = genai.GenerativeModel('gemini-1.5-flash', tools=[{"google_search_retrieval": {}}])
     model_pro = genai.GenerativeModel('gemini-1.5-pro')
 except Exception as e:
@@ -45,8 +44,6 @@ def calcular_score_proesc(dados):
         if valor and valor != "Não identificado" and valor != "null":
             score += peso
     
-    # Status baseado em Negócio (Proesc)
-    # Requisito para "Completa": Ter Diretor OU Telefone + Ter SGE ou Agenda
     tem_decisor = (dados.get("diretor") != "Não identificado" or dados.get("telefone_alternativo") != "Não identificado")
     tem_tech = (dados.get("sge_atual") != "Não identificado" or dados.get("agenda_digital") != "Não identificado")
     
@@ -59,15 +56,12 @@ def calcular_score_proesc(dados):
 # --- PIPELINE DE ENRIQUECIMENTO ---
 
 def normalizar_nome(nome):
-    """Limpa apenas espaços e caracteres inúteis, mantendo siglas (SESI, COC, etc)"""
     return re.sub(r"\s+", " ", str(nome).strip())
 
 def pipeline_ldr(nome, mun, uf):
-    # ETAPA 1: DESCOBERTA (Busca os Links Reais)
     prompt_1 = f"Localize o site oficial, Instagram e dados de registro da escola {nome} em {mun}-{uf}."
     try:
         res_1 = model_flash.generate_content(prompt_1)
-        # Extraímos os metadados brutos (evidências do Google)
         evidencias = res_1.text
         links = []
         if hasattr(res_1.candidates[0], 'grounding_metadata'):
@@ -77,21 +71,19 @@ def pipeline_ldr(nome, mun, uf):
     except:
         return None
 
-    # ETAPA 2: EXTRAÇÃO E INTERPRETAÇÃO (A IA analisa o que o Google achou)
     prompt_2 = f"""
     Analise estas evidências brutas: {evidencias}
     Sobre a escola: {nome}.
     Extraia EXCLUSIVAMENTE em JSON:
     - cnpj
     - razao_social
-    - diretor (Procure no QSA ou páginas institucional)
-    - telefone_alternativo (Um contato diferente do padrão)
+    - diretor
+    - telefone_alternativo
     - email
     - site
-    - sge_atual (Ex: Proesc, Sophia, Totvs, WPensar)
-    - agenda_digital (Ex: ClassApp, Agenda Edu)
-    - observacoes (Resumo técnico para abordagem de vendas)
-    
+    - sge_atual
+    - agenda_digital
+    - observacoes
     Regra: Use "Não identificado" se não houver evidência clara.
     """
     
@@ -120,7 +112,6 @@ with tab1:
 with tab2:
     if 'df_raw' in st.session_state:
         df = st.session_state['df_raw']
-        # Limpeza CRM (Coluna O / 14)
         if len(df.columns) > 14:
             df = df[~df.iloc[:, 14].astype(str).str.lower().str.contains('sim|yes|true|1', na=False)].copy()
         
@@ -138,23 +129,17 @@ with tab3:
     if 'df_final' in st.session_state:
         df_p = st.session_state['df_final']
         if st.button("🚀 INICIAR CICLO DE INTELIGÊNCIA"):
-            # Criar Rodada
             rodada = supabase.table("rodadas").insert({"nome_arquivo": "Remessa v4", "total_leads": len(df_p), "usuario_email": user_email}).execute()
             rid = rodada.data[0]['id']
-            
             prog = st.progress(0)
             status_txt = st.empty()
             
             for i, (idx, row) in enumerate(df_p.iterrows()):
-                nome_original = str(row.iloc[1])
-                nome_clean = normalizar_nome(nome_original)
+                nome_clean = normalizar_nome(str(row.iloc[1]))
                 mun, uf = str(row.iloc[4]), str(row.iloc[3])
+                status_txt.info(f"Analisando: **{nome_clean}**")
                 
-                status_txt.info(f"Analisando evidências de: **{nome_clean}** ({i+1}/{len(df_p)})")
-                
-                # Executar Pipeline
                 resultado = pipeline_ldr(nome_clean, mun, uf)
-                
                 if resultado:
                     score, status = calcular_score_proesc(resultado)
                     dados_supabase = {
@@ -163,24 +148,23 @@ with tab3:
                         **resultado
                     }
                 else:
-                    dados_supabase = {
-                        "rodada_id": rid, "nome_escola": nome_clean, "status": "Erro na Busca", "confianca": 0
-                    }
+                    dados_supabase = {"rodada_id": rid, "nome_escola": nome_clean, "status": "Erro na Busca", "confianca": 0}
                 
                 supabase.table("leads_enriquecidos").insert(dados_supabase).execute()
                 prog.progress((i + 1) / len(df_p))
                 time.sleep(1)
-            
-            st.success("✅ Rodada finalizada com sucesso!")
+            st.success("✅ Rodada finalizada!")
 
 with tab4:
-    rodadas = supabase.table("rodadas").select("*").eq("usuario_email", user_email).order("created_at", desc=True).execute()
-    for r in rodadas.data:
+    st.subheader("Auditoria de Rodadas")
+    # CORREÇÃO: select("*") em vez de select("")
+    rodadas_db = supabase.table("rodadas").select("*").eq("usuario_email", user_email).order("created_at", desc=True).execute()
+    for r in rodadas_db.data:
         with st.expander(f"📁 {r['created_at'][:16]} | {r['total_leads']} leads"):
-            leads = supabase.table("leads_enriquecidos").select("*").eq("rodada_id", r['id']).order("confianca", desc=True).execute()
-            if leads.data:
-                res_df = pd.DataFrame(leads.data)
-                # Ordenar por valor comercial
+            # CORREÇÃO: select("*") e remoção do erro de ordenação se a coluna não existisse
+            leads_db = supabase.table("leads_enriquecidos").select("*").eq("rodada_id", r['id']).order("confianca", desc=True).execute()
+            if leads_db.data:
+                res_df = pd.DataFrame(leads_db.data)
                 cols = ['confianca', 'status', 'nome_escola', 'sge_atual', 'agenda_digital', 'diretor', 'telefone_alternativo', 'email', 'site']
-                st.dataframe(res_df[cols])
-                st.download_button("📥 Baixar Planilha BDR", res_df.to_csv(index=False).encode('utf-8'), f"ldr_{r['id']}.csv")
+                st.dataframe(res_df[[c for c in cols if c in res_df.columns]])
+                st.download_button("📥 Baixar CSV", res_df.to_csv(index=False).encode('utf-8'), f"ldr_{r['id']}.csv")
