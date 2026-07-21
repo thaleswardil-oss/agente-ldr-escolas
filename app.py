@@ -5,41 +5,26 @@ from supabase import create_client
 import time
 import json
 
-# --- CONFIGURAÇÃO VISUAL (VERDE AMAZÔNIA) ---
+# --- CONFIGURAÇÃO VISUAL ---
 st.set_page_config(page_title="Agente LDR Amazônia", layout="wide")
 
 st.markdown("""
     <style>
-    /* Cores principais */
-    :root {
-        --verde-amazonia: #004225;
-        --verde-amapa: #64CD32;
-    }
-    /* Forçar cores de texto e botões */
-    h1, h2, h3, p, span, label, .stMarkdown { color: #004225 !important; }
-    
+    h1, h2, h3, p, span, label { color: #004225 !important; }
     .stButton>button {
-        background-color: #004225 ! Ads;
+        background-color: #004225 !important;
         color: white !important;
         border-radius: 8px;
-        width: 100%;
         font-weight: bold;
-        border: none;
-        padding: 10px;
     }
-    .stButton>button:hover { background-color: #64CD32 !important; }
-    
-    /* Estilo das abas */
-    .stTabs [data-baseweb="tab"] { color: #004225 !important; font-weight: bold; }
-    .stTabs [aria-selected="true"] { border-bottom: 3px solid #64CD32 !important; }
+    .stMetric { background-color: #f0f9eb; padding: 10px; border-radius: 10px; border: 1px solid #64CD32; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- INICIALIZAÇÃO DE APIs ---
+# --- INICIALIZAÇÃO DE CONEXÕES ---
 try:
     supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    # Configuração correta para busca real (Grounding)
     model = genai.GenerativeModel(
         model_name='gemini-1.5-flash-latest',
         tools=[{"google_search_retrieval": {}}]
@@ -47,140 +32,153 @@ try:
 except Exception as e:
     st.error(f"Erro de configuração: {e}")
 
-# --- FUNÇÃO DE ENRIQUECIMENTO ---
-def enriquecer_escola(nome, cidade, uf):
+# --- FUNÇÃO DE PESQUISA GEMINI ---
+def enriquecer_escola(nome, cidade, uf, endereco, telefone):
     prompt = f"""
-    Enriqueça os dados da escola '{nome}' em {cidade}-{uf} usando busca real.
+    Enriqueça os dados da escola '{nome}' localizada em {cidade}-{uf}.
+    Endereço base: {endereco}
+    Telefone base: {telefone}
+    
+    Use a busca real para encontrar:
+    1. CNPJ e Razão Social (Transparência/QSA).
+    2. Nome do Diretor ou Sócio (indique se veio do QSA).
+    3. E-mail e Telefone Alternativo atualizados.
+    4. SGE (Sistema de Gestão) e Agenda Digital (ex: Sophia, Totvs, WPensar, Agenda Edu).
+    5. Site oficial.
+    6. Uma breve observação para abordagem comercial.
+
     Retorne APENAS um JSON com estas chaves: 
     cnpj, razao_social, diretor, telefone_alternativo, email, sge_atual, agenda_digital, site, observacoes.
-    Use "Não identificado" para campos não encontrados.
+    Use "Não identificado" para o que não encontrar.
     """
     try:
         response = model.generate_content(prompt)
-        # Extração do JSON
         txt = response.text.replace('```json', '').replace('```', '').strip()
         dados = json.loads(txt)
         
-        # Extração das fontes (Audit Trail)
         fontes = []
         if hasattr(response.candidates[0], 'grounding_metadata'):
             meta = response.candidates[0].grounding_metadata
             if hasattr(meta, 'search_entry_point'):
                 fontes.append(meta.search_entry_point.rendered_content)
-        
         return dados, fontes
     except:
         return None, []
 
-# --- INTERFACE PRINCIPAL ---
-st.title("🌿 Agente LDR - Inteligência Comercial")
+# --- INTERFACE ---
+st.title("🌿 Agente LDR - Inteligência Comercial Proesc")
 
-# Sidebar para E-mail
-st.sidebar.header("Acesso")
-user_email = st.sidebar.text_input("Seu e-mail:")
+user_email = st.sidebar.text_input("Seu e-mail (Login):", value="")
 
 if not user_email:
-    st.info("👈 Por favor, informe seu e-mail na barra lateral.")
+    st.info("👈 Por favor, informe seu e-mail na barra lateral para começar.")
     st.stop()
 
-# Abas do Fluxo
 tab1, tab2, tab3, tab4 = st.tabs(["📂 1. Upload", "🎯 2. Filtros", "🚀 3. Processar", "📜 4. Histórico"])
 
 # ABA 1: UPLOAD
 with tab1:
-    st.subheader("Subir Planilha do INEP")
-    file = st.file_uploader("Arquivo .xlsx", type="xlsx")
+    file = st.file_uploader("Subir Planilha padrão INEP", type="xlsx")
     if file:
-        df_ini = pd.read_excel(file)
-        st.session_state['df_raw'] = df_ini
-        st.success(f"Carregado: {len(df_ini)} registros.")
+        df_raw = pd.read_excel(file)
+        st.session_state['df_raw'] = df_raw
+        st.success(f"Planilha carregada com {len(df_raw)} linhas!")
 
-# ABA 2: FILTROS
+# ABA 2: FILTROS E LIMPEZA CRM
 with tab2:
     if 'df_raw' in st.session_state:
         df = st.session_state['df_raw']
         
-        # Identificar colunas automaticamente
-        def find_c(list_names):
-            for n in list_names:
-                for c in df.columns:
-                    if n.lower() in c.lower(): return c
-            return df.columns[0]
+        # Mapeamento Flexível de Colunas
+        def find_c(targets, default_idx):
+            for t in targets:
+                for i, c in enumerate(df.columns):
+                    if t.lower() in str(c).lower(): return c
+            if len(df.columns) > default_idx: return df.columns[default_idx]
+            return None
 
-        c_uf = find_c(['uf', 'estado'])
-        c_porte = find_c(['porte', 'tamanho'])
+        col_nome = find_c(['nome', 'escola'], 1)
+        col_uf = find_c(['uf', 'estado'], 3)
+        col_mun = find_c(['município', 'municipio', 'cidade'], 4)
+        col_end = find_c(['endereço', 'endereco', 'logradouro'], 7)
+        col_tel = find_c(['telefone', 'fone'], 8)
+        col_porte = find_c(['porte', 'tamanho'], 12)
+        col_crm = find_c(['crm', 'está no crm'], 14)
+
+        st.subheader("Configurar Filtros e Limpeza")
         
-        st.subheader("Configurar Remessa")
-        col1, col2 = st.columns(2)
-        with col1:
-            f_uf = st.selectbox("Filtrar UF", ["Todos"] + sorted(list(df[c_uf].unique())))
-        with col2:
-            f_porte = st.selectbox("Filtrar Porte", ["Todos"] + sorted(list(df[c_porte].unique())))
+        # 1. Filtro Automático CRM
+        if col_crm:
+            antes = len(df)
+            df_limpo = df[~df[col_crm].astype(str).str.lower().str.contains('sim|yes|true|1', na=False)].copy()
+            removidos = antes - len(df_limpo)
+            if removidos > 0:
+                st.warning(f"🚫 {removidos} escolas removidas porque já estão no CRM.")
+        else:
+            df_limpo = df.copy()
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            uf_list = ["Todos"] + sorted([str(x) for x in df_limpo[col_uf].unique()]) if col_uf else ["N/A"]
+            f_uf = st.selectbox("Filtrar UF", uf_list)
+        with c2:
+            porte_list = ["Todos"] + sorted([str(x) for x in df_limpo[col_porte].unique()]) if col_porte else ["N/A"]
+            f_porte = st.selectbox("Filtrar Porte", porte_list)
+        with c3:
+            limite = st.number_input("Quantidade para processar", 1, 500, 10)
         
-        limite = st.number_input("Quantidade de escolas para enriquecer", 1, 100, 10)
-        
-        # Aplicar filtros
-        dff = df.copy()
-        if f_uf != "Todos": dff = dff[dff[c_uf] == f_uf]
-        if f_porte != "Todos": dff = dff[dff[c_porte] == f_porte]
+        # Aplicar Filtros
+        dff = df_limpo.copy()
+        if col_uf and f_uf != "Todos": dff = dff[dff[col_uf].astype(str) == f_uf]
+        if col_porte and f_porte != "Todos": dff = dff[dff[col_porte].astype(str) == f_porte]
         dff = dff.head(limite)
         
         st.session_state['df_final'] = dff
-        st.metric("Escolas selecionadas", len(dff))
-        st.write("Se estiver tudo certo, vá para a aba **3. Processar**.")
+        st.metric("Prontas para enriquecer", len(dff))
     else:
-        st.warning("Aguardando planilha na aba 1.")
+        st.write("Aguardando upload...")
 
 # ABA 3: PROCESSAR
 with tab3:
     if 'df_final' in st.session_state:
         dff = st.session_state['df_final']
-        st.subheader("Iniciar Enriquecimento Real")
-        st.write("O agente usará o Google Search para encontrar dados oficiais.")
-        
-        if st.button("🚀 INICIAR AGORA"):
-            # Registrar Rodada
-            new_r = supabase.table("rodadas").insert({
-                "nome_arquivo": "Processamento LDR",
-                "total_leads": len(dff),
-                "usuario_email": user_email
+        if st.button("🚀 INICIAR ENRIQUECIMENTO REAL"):
+            res_rodada = supabase.table("rodadas").insert({
+                "nome_arquivo": "Remessa INEP", "total_leads": len(dff), "usuario_email": user_email
             }).execute()
-            rid = new_r.data[0]['id']
+            rid = res_rodada.data[0]['id']
             
             barra = st.progress(0)
             status = st.empty()
             
             for i, (idx, row) in enumerate(dff.iterrows()):
-                nome_esc = str(row.get('Escola') or row.get('Nome') or "Escola")
-                status.text(f"Enriquecendo ({i+1}/{len(dff)}): {nome_esc}")
+                nome_esc = str(row.get(col_nome, "Escola Desconhecida"))
+                status.text(f"🔍 Pesquisando: {nome_esc}...")
                 
                 res, urls = enriquecer_escola(
                     nome_esc, 
-                    row.get('Município') or row.get('Municipio', ''),
-                    row.get('UF', '')
+                    str(row.get(col_mun, '')),
+                    str(row.get(col_uf, '')),
+                    str(row.get(col_end, '')),
+                    str(row.get(col_tel, ''))
                 )
                 
-                # Salvar no banco
-                insert_data = {
-                    "rodada_id": rid,
-                    "nome_escola": nome_esc,
-                    "municipio": row.get('Município') or row.get('Municipio', ''),
-                    "uf": row.get('UF', ''),
-                    "status": "Completa" if res else "Sem dados",
-                    "fontes": urls
+                # Salvar no Supabase
+                dados_save = {
+                    "rodada_id": rid, "nome_escola": nome_esc, "fontes": urls,
+                    "status": "Completa" if res else "Sem dados"
                 }
-                if res: insert_data.update(res)
-                supabase.table("leads_enriquecidos").insert(insert_data).execute()
-                
+                if res: dados_save.update(res)
+                supabase.table("leads_enriquecidos").insert(dados_save).execute()
                 barra.progress((i + 1) / len(dff))
             
-            st.success("✅ Processamento finalizado! Veja os dados na aba Histórico.")
+            st.success("✅ Processamento finalizado! Confira o histórico.")
     else:
-        st.info("Configure os filtros na aba anterior.")
+        st.write("Aguardando filtros...")
 
 # ABA 4: HISTÓRICO
 with tab4:
-    st.subheader("Minhas Rodadas")
+    st.subheader("Meus Enriquecimentos")
     rodadas = supabase.table("rodadas").select("*").eq("usuario_email", user_email).order("created_at", desc=True).execute()
     
     for r in rodadas.data:
@@ -189,6 +187,5 @@ with tab4:
             if leads.data:
                 df_res = pd.DataFrame(leads.data)
                 st.dataframe(df_res)
-                # Exportar
                 csv = df_res.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Baixar Excel (CSV)", csv, f"leads_{r['id']}.csv", "text/csv")
+                st.download_button("📥 Baixar CSV", csv, f"leads_{r['id']}.csv", "text/csv")
