@@ -6,7 +6,7 @@ import time
 import json
 
 # --- CONFIGURAÇÃO VISUAL ---
-st.set_page_config(page_title="Agente LDR Amazônia", layout="wide")
+st.set_page_config(page_title="Agente LDR Proesc", layout="wide")
 
 st.markdown("""
     <style>
@@ -21,171 +21,154 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- INICIALIZAÇÃO DE CONEXÕES ---
+# --- CONEXÕES ---
 try:
     supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    # gemini-1.5-flash-latest é o mais estável para busca real
     model = genai.GenerativeModel(
         model_name='gemini-1.5-flash-latest',
         tools=[{"google_search_retrieval": {}}]
     )
 except Exception as e:
-    st.error(f"Erro de configuração inicial: {e}")
+    st.error(f"Erro de conexão: {e}")
 
-# --- FUNÇÃO DE PESQUISA GEMINI ---
-def enriquecer_escola(nome, cidade, uf, endereco, telefone):
+# --- FUNÇÃO DE PESQUISA (PROMPT ESTILO LOVABLE/BDR) ---
+def enriquecer_escola(nome, cidade, uf, endereco, tel_inep):
     prompt = f"""
-    Enriqueça os dados da escola '{nome}' em {cidade}-{uf}. 
-    Endereço: {endereco}. Tel: {telefone}.
+    Você é um especialista em inteligência de mercado educacional.
+    PESQUISE NO GOOGLE A ESCOLA: {nome} em {cidade}-{uf}.
     
-    Retorne um JSON puro (sem markdown) com: 
+    DADOS ORIGINAIS:
+    Endereço: {endereco}
+    Telefone INEP: {tel_inep}
+
+    REQUISITOS DE EXTRAÇÃO:
+    1. CNPJ e Razão Social exata.
+    2. Diretor/Responsável (se achar no QSA, indique).
+    3. Identifique o SGE (Ex: Proesc, Sophia, Totvs, WPensar, RM, Lyceum).
+    4. Identifique a Agenda Digital (Ex: Agenda Edu, ClassApp, ClipEscola).
+    5. E-mail de contato e Site.
+    6. Observação comercial curta para o BDR.
+
+    Responda APENAS em JSON puro com as chaves:
     cnpj, razao_social, diretor, telefone_alternativo, email, sge_atual, agenda_digital, site, observacoes.
-    Use "Não identificado" para campos vazios.
+    Use "Não identificado" se não encontrar.
     """
     try:
         response = model.generate_content(prompt)
         txt = response.text.replace('```json', '').replace('```', '').strip()
-        dados = json.loads(txt)
-        
-        fontes = []
-        if hasattr(response.candidates[0], 'grounding_metadata'):
-            meta = response.candidates[0].grounding_metadata
-            if hasattr(meta, 'search_entry_point'):
-                fontes.append(meta.search_entry_point.rendered_content)
-        return dados, fontes
+        return json.loads(txt), response.candidates[0].grounding_metadata.search_entry_point.rendered_content if hasattr(response.candidates[0], 'grounding_metadata') else ""
     except:
-        return None, []
+        return None, ""
 
 # --- INTERFACE ---
-st.title("🌿 Agente LDR - Inteligência Proesc")
+st.title("🌿 Agente LDR - Inteligência Comercial")
 
-user_email = st.sidebar.text_input("Seu e-mail de acesso:", value="")
-
+user_email = st.sidebar.text_input("Seu e-mail:", value="thales@proesc.com")
 if not user_email:
-    st.info("👈 Digite seu e-mail na lateral para liberar o sistema.")
+    st.info("👈 Informe seu e-mail para começar.")
     st.stop()
 
 tab1, tab2, tab3, tab4 = st.tabs(["📂 1. Upload", "🎯 2. Filtros", "🚀 3. Processar", "📜 4. Histórico"])
 
-# ABA 1: UPLOAD
 with tab1:
-    st.subheader("Subir Planilha INEP")
-    file = st.file_uploader("Selecione o arquivo .xlsx", type="xlsx")
+    file = st.file_uploader("Subir Planilha INEP (Colunas A-O)", type="xlsx")
     if file:
+        # Lendo sem cabeçalho para garantir os índices
         df_raw = pd.read_excel(file)
         st.session_state['df_raw'] = df_raw
-        st.success(f"Planilha carregada: {len(df_raw)} escolas encontradas.")
+        st.success(f"Carregado: {len(df_raw)} escolas.")
 
-# ABA 2: FILTROS E MAPEAMENTO INEP (A-O)
 with tab2:
     if 'df_raw' in st.session_state:
         df = st.session_state['df_raw']
         
-        # BUSCADOR DE COLUNAS (Agora com str(c) para evitar o erro da sua imagem)
-        def find_c(keywords, index_fallback):
-            # 1. Tenta por nome
-            for k in keywords:
-                for c in df.columns:
-                    if k.lower() in str(c).lower(): return c
-            # 2. Tenta pela posição INEP (A=0, B=1...)
-            if len(df.columns) > index_fallback:
-                return df.columns[index_fallback]
-            return None
-
-        # Mapeamento conforme sua lista (A-O)
-        col_nome  = find_c(['escola', 'nome'], 1)       # B
-        col_uf    = find_c(['uf', 'estado'], 3)         # D
-        col_mun   = find_c(['município', 'cidade'], 4)  # E
-        col_end   = find_c(['endereço', 'logradouro'], 7) # H
-        col_tel   = find_c(['telefone', 'fone'], 8)     # I
-        col_porte = find_c(['porte'], 12)               # M
-        col_crm   = find_c(['crm', 'está no'], 14)      # O
-
-        st.subheader("Configuração da Remessa")
-
-        # FILTRO DE CRM (Regra: Excluir quem está marcado como Sim)
-        if col_crm:
+        # MAPEAMENTO FIXO PELO PADRÃO INEP QUE VOCÊ PASSOU:
+        # A:0(Status), B:1(Nome), D:3(UF), E:4(Mun), H:7(End), I:8(Tel), M:12(Porte), O:14(CRM)
+        
+        st.subheader("Configuração de Remessa")
+        
+        # Filtro CRM Automático (Coluna O / Índice 14)
+        col_crm_idx = 14
+        if len(df.columns) > col_crm_idx:
             antes = len(df)
-            df_limpo = df[~df[col_crm].astype(str).str.lower().str.contains('sim|yes|true|1', na=False)].copy()
-            removidos = antes - len(df_limpo)
-            if removidos > 0:
-                st.warning(f"💡 {removidos} escolas removidas por já estarem no CRM.")
-        else:
-            df_limpo = df.copy()
+            df = df[~df.iloc[:, col_crm_idx].astype(str).str.lower().str.contains('sim|yes|true|1', na=False)].copy()
+            st.warning(f"💡 {antes - len(df)} escolas removidas (já estão no CRM).")
 
         c1, c2, c3 = st.columns(3)
         with c1:
-            ufs = ["Todos"] + sorted([str(x) for x in df_limpo[col_uf].unique()]) if col_uf else ["N/A"]
+            uf_col = 3 # Coluna D
+            ufs = ["Todos"] + sorted([str(x) for x in df.iloc[:, uf_col].unique()])
             f_uf = st.selectbox("Estado", ufs)
         with c2:
-            portes = ["Todos"] + sorted([str(x) for x in df_limpo[col_porte].unique()]) if col_porte else ["N/A"]
+            porte_col = 12 # Coluna M
+            portes = ["Todos"] + sorted([str(x) for x in df.iloc[:, porte_col].unique()])
             f_porte = st.selectbox("Porte", portes)
         with c3:
-            limite = st.number_input("Quantidade", 1, 500, 10)
+            limite = st.number_input("Qtd. Leads", 1, 500, 10)
 
-        # Aplicar Filtros Finais
-        df_f = df_limpo.copy()
-        if col_uf and f_uf != "Todos": df_f = df_f[df_f[col_uf].astype(str) == f_uf]
-        if col_porte and f_porte != "Todos": df_f = df_f[df_f[col_porte].astype(str) == f_porte]
-        df_f = df_f.head(limite)
+        # Aplicar Filtros
+        if f_uf != "Todos": df = df[df.iloc[:, uf_col].astype(str) == f_uf]
+        if f_porte != "Todos": df = df[df.iloc[:, porte_col].astype(str) == f_porte]
+        df_final = df.head(limite)
         
-        st.session_state['df_final'] = df_f
-        st.metric("Total selecionado", len(df_f))
+        st.session_state['df_final'] = df_final
+        st.metric("Prontas para Enriquecer", len(df_final))
     else:
-        st.write("Aguardando upload na Aba 1.")
+        st.write("Aguardando arquivo...")
 
-# ABA 3: PROCESSAR
 with tab3:
     if 'df_final' in st.session_state:
-        df_proc = st.session_state['df_final']
-        if st.button("🚀 INICIAR ENRIQUECIMENTO"):
-            # Criar rodada no Supabase
-            nova_rodada = supabase.table("rodadas").insert({
-                "nome_arquivo": "Remessa INEP", "total_leads": len(df_proc), "usuario_email": user_email
+        dff = st.session_state['df_final']
+        if st.button("🚀 INICIAR PROCESSO"):
+            res_rodada = supabase.table("rodadas").insert({
+                "nome_arquivo": "Remessa LDR", "total_leads": len(dff), "usuario_email": user_email
             }).execute()
-            rid = nova_rodada.data[0]['id']
+            rid = res_rodada.data[0]['id']
             
-            prog = st.progress(0)
-            status_txt = st.empty()
+            barra = st.progress(0)
+            status_log = st.empty()
             
-            for i, (idx, row) in enumerate(df_proc.iterrows()):
-                nome = str(row.get(col_nome, "Escola"))
-                status_txt.text(f"Processando ({i+1}/{len(df_proc)}): {nome}")
+            for i, (idx, row) in enumerate(dff.iterrows()):
+                # Pegando dados pelos índices exatos da sua lista
+                nome = str(row.iloc[1]) # Coluna B
+                uf = str(row.iloc[3])   # Coluna D
+                mun = str(row.iloc[4])  # Coluna E
+                end = str(row.iloc[7])  # Coluna H
+                tel = str(row.iloc[8])  # Coluna I
                 
-                # Chamada IA
-                res, urls = enriquecer_escola(
-                    nome, 
-                    str(row.get(col_mun, '')), 
-                    str(row.get(col_uf, '')),
-                    str(row.get(col_end, '')),
-                    str(row.get(col_tel, ''))
-                )
+                status_log.text(f"Enriquecendo ({i+1}/{len(dff)}): {nome}")
                 
-                # Salvar no Banco
-                dados_final = {
-                    "rodada_id": rid, "nome_escola": nome, "fontes": urls,
-                    "status": "Completa" if res else "Sem dados"
+                res, fonte_html = enriquecer_escola(nome, mun, uf, end, tel)
+                
+                # Dados para salvar (Garante que os dados originais do INEP fiquem salvos)
+                dados_save = {
+                    "rodada_id": rid,
+                    "nome_escola": nome,
+                    "municipio": mun,
+                    "uf": uf,
+                    "telefone_inep": tel,
+                    "status": "Completa" if res else "Sem dados",
+                    "fontes": [fonte_html] if fonte_html else []
                 }
-                if res: dados_final.update(res)
-                supabase.table("leads_enriquecidos").insert(dados_final).execute()
+                if res: dados_save.update(res)
                 
-                prog.progress((i + 1) / len(df_proc))
+                supabase.table("leads_enriquecidos").insert(dados_save).execute()
+                barra.progress((i + 1) / len(dff))
             
-            st.success("✅ Concluído! Vá para a Aba 4 para baixar.")
+            st.success("✅ Finalizado! Veja na aba Histórico.")
     else:
-        st.info("Defina os filtros primeiro.")
+        st.write("Aguardando filtros...")
 
-# ABA 4: HISTÓRICO
 with tab4:
-    st.subheader("Histórico de Rodadas")
+    st.subheader("Histórico")
     rodadas = supabase.table("rodadas").select("*").eq("usuario_email", user_email).order("created_at", desc=True).execute()
-    
     for r in rodadas.data:
         with st.expander(f"📁 {r['created_at'][:16]} - {r['total_leads']} leads"):
             leads = supabase.table("leads_enriquecidos").select("*").eq("rodada_id", r['id']).execute()
             if leads.data:
                 res_df = pd.DataFrame(leads.data)
-                st.dataframe(res_df)
-                csv = res_df.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Baixar CSV", csv, f"leads_{r['id']}.csv", "text/csv")
+                # Reorganizar colunas para ficar igual ao seu print antigo
+                cols_order = ['nome_escola', 'municipio', 'uf', 'telefone_inep', 'cnpj', 'razao_social', 'diretor', 'email', 'site', 'sge_atual', 'agenda_digital', 'observacoes']
+                st.dataframe(res_df[[c for c in cols_order if c in res_df.columns]])
+                st.download_button("📥 Baixar CSV", res_df.to_csv(index=False).encode('utf-8'), f"leads_{r['id']}.csv")
