@@ -54,7 +54,7 @@ st.markdown(f"""
 # --- CONEXÕES ---
 supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-model = genai.GenerativeModel(model_name='gemini-1.5-flash', tools=[{"google_search": {}}])
+model = genai.GenerativeModel(model_name='gemini-1.5-flash-latest', tools=[{"google_search_retrieval": {}}])
 
 # --- FUNÇÃO DE PESQUISA ---
 def pesquisar_escola(escola_dados):
