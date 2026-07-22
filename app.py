@@ -5,11 +5,16 @@ import re
 import time
 import traceback
 import unicodedata
+from io import BytesIO
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import pandas as pd
 import streamlit as st
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
 try:
     from supabase import create_client
@@ -38,7 +43,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-BUILD_ID = "2026.07.22.TAVILY.1"
+BUILD_ID = "2026.07.22.TAVILY.3"
 VALOR_NAO_IDENTIFICADO = "Não identificado"
 DELAYS_RETRY = [2, 4, 8, 16]
 MAX_TENTATIVAS = len(DELAYS_RETRY) + 1
@@ -290,17 +295,27 @@ def normalizar_email(email):
 
 def normalizar_telefone(telefone):
     texto = texto_seguro(telefone)
-    encontrados = re.findall(r"(?:\+?55\s*)?(?:\(?\d{2}\)?\s*)?(?:9?\d{4})[\s\-]?\d{4}", texto)
-    candidato = encontrados[0] if encontrados else texto
-    digitos = re.sub(r"\D", "", candidato)
-    if digitos.startswith("55") and len(digitos) in {12, 13}:
-        digitos = digitos[2:]
-    if len(digitos) == 11:
-        return f"({digitos[:2]}) {digitos[2:7]}-{digitos[7:]}"
-    if len(digitos) == 10:
-        return f"({digitos[:2]}) {digitos[2:6]}-{digitos[6:]}"
+    candidatos = re.findall(
+        r"(?<!\d)(?:\+?55[\s.-]*)?(?:\(?([1-9]\d)\)?[\s.-]*)?(9?\d{4})[\s.-]?(\d{4})(?!\d)",
+        texto,
+    )
+    ddds_validos = {
+        "11", "12", "13", "14", "15", "16", "17", "18", "19", "21", "22", "24", "27", "28",
+        "31", "32", "33", "34", "35", "37", "38", "41", "42", "43", "44", "45", "46", "47", "48", "49",
+        "51", "53", "54", "55", "61", "62", "63", "64", "65", "66", "67", "68", "69", "71", "73", "74", "75",
+        "77", "79", "81", "82", "83", "84", "85", "86", "87", "88", "89", "91", "92", "93", "94", "95", "96",
+        "97", "98", "99",
+    }
+    for ddd, parte_1, parte_2 in candidatos:
+        if ddd not in ddds_validos:
+            continue
+        numero = parte_1 + parte_2
+        if len(numero) not in {8, 9} or len(set(numero)) == 1:
+            continue
+        if len(numero) == 9 and not numero.startswith("9"):
+            continue
+        return f"({ddd}) {numero[:5]}-{numero[5:]}" if len(numero) == 9 else f"({ddd}) {numero[:4]}-{numero[4:]}"
     return VALOR_NAO_IDENTIFICADO
-
 
 def normalizar_url(url):
     texto = texto_seguro(url).strip(".,;:()[]{}<>\"'")
@@ -552,6 +567,8 @@ def chamada_search(tavily, query):
         "include_answer": "advanced",
         "include_raw_content": "markdown",
         "chunks_per_source": 5,
+        "country": "brazil",
+        "exclude_domains": ["johncatt.com", "querobolsa.com.br", "melhorescola.com.br", "escol.as", "escavador.com", "jusbrasil.com.br", "linkedin.com", "youtube.com", "pinterest.com", "exato.digital"],
     }
     try:
         return tavily.search(**parametros)
@@ -589,55 +606,39 @@ def chamada_extract(tavily, urls, foco):
 def schema_resultado_tavily():
     candidato = {
         "type": "object",
+        "description": "Dado encontrado com prova verificável e URL da fonte.",
         "properties": {
             "valor": {"type": "string"},
-            "tipo_fonte": {
-                "type": "string",
-                "enum": ["site_oficial", "receita", "qsa", "google_maps", "instagram", "facebook", "outro"],
-            },
+            "tipo_fonte": {"type": "string", "enum": ["site_oficial", "receita", "qsa", "google_maps", "instagram", "facebook", "outro"]},
             "url": {"type": "string"},
             "evidencia": {"type": "string"},
             "confianca": {"type": "number"},
         },
         "required": ["valor", "tipo_fonte", "url", "evidencia", "confianca"],
     }
-    lista_candidato = {"type": "array", "items": candidato}
+    lista = {"type": "array", "items": candidato}
     return {
-        "type": "object",
         "properties": {
             "identidade_confirmada": {"type": "boolean"},
             "nome_oficial": {"type": "string"},
+            "municipio_confirmado": {"type": "string"},
+            "uf_confirmada": {"type": "string"},
             "justificativa_identidade": {"type": "string"},
-            "razao_social_candidatos": lista_candidato,
-            "cnpj_candidatos": lista_candidato,
-            "site_candidatos": lista_candidato,
-            "diretor_candidatos": lista_candidato,
-            "telefone_alternativo_candidatos": lista_candidato,
-            "email_candidatos": lista_candidato,
-            "sge_atual_candidatos": lista_candidato,
-            "agenda_digital_candidatos": lista_candidato,
+            "razao_social_candidatos": lista,
+            "cnpj_candidatos": lista,
+            "site_candidatos": lista,
+            "diretor_candidatos": lista,
+            "socio_mantenedor_candidatos": lista,
+            "telefone_alternativo_candidatos": lista,
+            "email_candidatos": lista,
+            "sge_atual_candidatos": lista,
+            "agenda_digital_candidatos": lista,
             "observacoes": {"type": "string"},
             "observacoes_tecnologia": {"type": "string"},
             "conflitos": {"type": "array", "items": {"type": "string"}},
         },
-        "required": [
-            "identidade_confirmada",
-            "nome_oficial",
-            "justificativa_identidade",
-            "razao_social_candidatos",
-            "cnpj_candidatos",
-            "site_candidatos",
-            "diretor_candidatos",
-            "telefone_alternativo_candidatos",
-            "email_candidatos",
-            "sge_atual_candidatos",
-            "agenda_digital_candidatos",
-            "observacoes",
-            "observacoes_tecnologia",
-            "conflitos",
-        ],
+        "required": ["identidade_confirmada", "nome_oficial", "municipio_confirmado", "uf_confirmada", "justificativa_identidade", "razao_social_candidatos", "cnpj_candidatos", "site_candidatos", "diretor_candidatos", "socio_mantenedor_candidatos", "telefone_alternativo_candidatos", "email_candidatos", "sge_atual_candidatos", "agenda_digital_candidatos", "observacoes", "observacoes_tecnologia", "conflitos"],
     }
-
 
 def chamada_research(tavily, prompt, modelo):
     parametros = {
@@ -678,14 +679,18 @@ def aguardar_research(tavily, tarefa, logger):
 
 
 def construir_query(dados, objetivo):
-    base = f'"{dados["nome_escola"]}" "{dados["municipio"]}" {dados["uf"]}'
-    consultas = {
-        "identidade": f"{base} site oficial CNPJ razão social endereço Google Maps",
-        "contatos": f"{base} diretor diretora mantenedor telefone WhatsApp email contato",
-        "tecnologia": f"{base} sistema de gestão escolar SGE ERP portal do aluno agenda digital aplicativo login",
-    }
-    return consultas[objetivo]
-
+    nome, municipio, uf = dados["nome_escola"], dados["municipio"], dados["uf"]
+    base = f'"{nome}" "{municipio}" "{uf}"'
+    telefone = dados.get("telefone_inep", "")
+    if valor_presente(telefone):
+        base += f' "{telefone}"'
+    return {
+        "identidade": f'{base} site oficial endereço CNPJ razão social escola',
+        "governanca": f'{base} diretor diretora mantenedor mantenedora sócio sócia QSA CNPJ',
+        "contatos": f'{base} site oficial contato telefone WhatsApp email secretaria',
+        "tecnologia": f'{base} site oficial portal do aluno login aplicativo agenda digital sistema de gestão escolar SGE ERP',
+        "redes": f'{base} Instagram Facebook diretor diretora mantenedor escola oficial',
+    }[objetivo]
 
 def montar_evidencias_busca(respostas):
     blocos = []
@@ -745,36 +750,34 @@ def montar_evidencias_extract(resposta):
 
 def construir_prompt_research(dados, evidencias):
     return f"""
-Investigue e enriqueça uma única escola brasileira para prospecção comercial B2B.
+Enriqueça UMA ÚNICA escola brasileira. A precisão é mais importante que preencher campos.
 
 ESCOLA ALVO
 Nome original no INEP: {dados['nome_original']}
 Nome normalizado: {dados['nome_escola']}
-Município: {dados['municipio']}
-UF: {dados['uf']}
+Município obrigatório: {dados['municipio']}
+UF obrigatória: {dados['uf']}
 Telefone do INEP: {dados['telefone_inep']}
 
-OBJETIVOS
-Confirmar a identidade exata da mesma escola e da mesma unidade.
-Encontrar nome oficial, razão social, CNPJ, site oficial, diretor ou diretora, telefone alternativo, WhatsApp, e-mail, SGE atual, portal do aluno, aplicativo e agenda digital.
-Produzir observações comerciais objetivas.
-
-EVIDÊNCIAS JÁ COLETADAS
+EVIDÊNCIAS COLETADAS
 {evidencias}
 
 REGRAS
-Não misture escolas homônimas, unidades de outra cidade ou outra mantenedora.
-Não invente dados.
-Cada candidato deve incluir valor, URL, evidência textual, tipo da fonte e confiança de 0 a 100.
-Quando houver conflito, mantenha os candidatos separados.
-Classifique a fonte somente como site_oficial, receita, qsa, google_maps, instagram, facebook ou outro.
-Prioridade de confiança: site oficial, Receita, QSA, Google Maps, Instagram, Facebook.
-Não trate sistema de ensino, material didático, Google Classroom, WhatsApp ou rede social como SGE sem evidência explícita.
-Não trate fornecedor financeiro como SGE.
-Use listas vazias para campos sem evidência.
-A identidade só deve ser confirmada quando nome, município/UF e ao menos outro identificador forem compatíveis.
+1. Não misture escolas homônimas, unidades, cidades, estados ou mantenedoras.
+2. Confirme município e UF antes de aceitar qualquer campo.
+3. Confirme identidade apenas com nome compatível + município/UF + endereço, telefone, domínio oficial ou CNPJ.
+4. Se a identidade não estiver confirmada, retorne todas as listas vazias.
+5. Cada candidato precisa de URL completa e trecho textual que contenha ou comprove o valor.
+6. Nunca use dados de terceiros, fornecedores, anúncios, diretórios internacionais ou escolas de outra localidade.
+7. Nunca invente, complete ou deduza dados ausentes.
+8. Busque diretor em site oficial, equipe, documentos institucionais e redes oficiais.
+9. Busque sócio, administrador ou mantenedor em CNPJ/QSA e mantenha separado de diretor.
+10. Procure SGE e agenda no site oficial, portal do aluno, área restrita, login, aplicativos, políticas, subdomínios, landing pages e comunicados.
+11. Só informe SGE ou agenda com nome explícito, domínio do fornecedor, link de login/app ou documento oficial.
+12. Google Classroom, WhatsApp, material didático, sistema de ensino e fornecedor financeiro não são SGE sem prova explícita.
+13. Priorize site oficial, Receita/QSA, Google Maps, Instagram e Facebook.
+14. Em conflito, mantenha candidatos separados e não escolha pela ordem de aparição.
 """
-
 
 def preparar_candidatos(valor):
     if valor is None:
@@ -871,7 +874,7 @@ def step_1_pesquisa(dados, tavily, modelo_research, logger):
     logger.info("STEP 1", f"Buscando escola {dados['nome_escola']}.")
     respostas_busca = {}
     erros = []
-    for objetivo in ["identidade", "contatos", "tecnologia"]:
+    for objetivo in ["identidade", "governanca", "contatos", "tecnologia", "redes"]:
         query = construir_query(dados, objetivo)
         try:
             respostas_busca[objetivo] = executar_com_retry(
@@ -954,160 +957,108 @@ def step_1_pesquisa(dados, tavily, modelo_research, logger):
 
 
 def extrair_cnpjs_evidencias(evidencias):
-    candidatos = []
-    for encontrado in re.findall(r"\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b", evidencias):
-        normalizado = normalizar_cnpj(encontrado)
-        if normalizado != VALOR_NAO_IDENTIFICADO:
-            candidatos.append({"valor": normalizado, "tipo_fonte": "outro", "url": "", "confianca": 35})
-    return candidatos
-
+    return []
 
 def extrair_emails_evidencias(evidencias):
-    candidatos = []
-    for encontrado in re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", evidencias):
-        candidatos.append({"valor": encontrado, "tipo_fonte": "outro", "url": "", "confianca": 25})
-    return candidatos
-
+    return []
 
 def extrair_telefones_evidencias(evidencias):
-    candidatos = []
-    padrao = r"(?:\+?55\s*)?(?:\(?\d{2}\)?\s*)?(?:9?\d{4})[\s\-]?\d{4}"
-    for encontrado in re.findall(padrao, evidencias):
-        normalizado = normalizar_telefone(encontrado)
-        if normalizado != VALOR_NAO_IDENTIFICADO:
-            candidatos.append({"valor": normalizado, "tipo_fonte": "outro", "url": "", "confianca": 20})
-    return candidatos
+    return []
+
+def fonte_esta_no_dossie(url, fontes):
+    normalizada = normalizar_url(url)
+    if normalizada == VALOR_NAO_IDENTIFICADO:
+        return False
+    dominio = urlparse(normalizada).netloc.lower().removeprefix("www.")
+    for fonte in fontes:
+        fonte_url = normalizar_url(objeto_para_dict(fonte).get("url", ""))
+        if fonte_url == VALOR_NAO_IDENTIFICADO:
+            continue
+        outro = urlparse(fonte_url).netloc.lower().removeprefix("www.")
+        if dominio == outro or dominio.endswith("." + outro) or outro.endswith("." + dominio):
+            return True
+    return False
+
+
+def filtrar_candidatos_com_prova(candidatos, fontes, logger, step, campo):
+    validos = []
+    for candidato in preparar_candidatos(candidatos):
+        item = objeto_para_dict(candidato)
+        url = texto_seguro(item.get("url", ""))
+        evidencia = normalizar_espacos(item.get("evidencia", ""))
+        valor = normalizar_espacos(item.get("valor", ""))
+        if not url or not evidencia or not valor:
+            logger.alerta(step, f"Candidato de {campo} descartado por falta de URL, evidência ou valor.")
+            continue
+        if not fonte_esta_no_dossie(url, fontes):
+            logger.alerta(step, f"Candidato de {campo} descartado: URL fora das fontes pesquisadas.", url)
+            continue
+        valor_limpo = re.sub(r"\W", "", remover_acentos(valor).lower())
+        evidencia_limpa = re.sub(r"\W", "", remover_acentos(evidencia).lower())
+        if len(valor_limpo) >= 5 and valor_limpo not in evidencia_limpa:
+            logger.alerta(step, f"Candidato de {campo} descartado: trecho não comprova o valor.", serializar_json(item))
+            continue
+        validos.append(item)
+    return validos
+
+
+def identidade_compativel(dados, objeto):
+    municipio = remover_acentos(texto_seguro(objeto.get("municipio_confirmado", ""))).lower()
+    alvo = remover_acentos(dados["municipio"]).lower()
+    return municipio == alvo and normalizar_uf(objeto.get("uf_confirmada", "")) == dados["uf"]
 
 
 def step_2_validacao_identidade(dados, pesquisa, logger):
     logger.info("STEP 2", "Validação da identidade iniciada.")
     objeto = pesquisa.get("research", {})
-    cnpj_candidatos = preparar_candidatos(extrair_lista(objeto, "cnpj"))
-    if not cnpj_candidatos:
-        cnpj_candidatos = extrair_cnpjs_evidencias(pesquisa.get("evidencias", ""))
-    razao_social, razao_escolhida = selecionar_candidato(
-        extrair_lista(objeto, "razao_social"),
-        normalizar_valor_generico,
-        logger,
-        "STEP 2",
-        "razão social",
-    )
-    cnpj, cnpj_escolhido = selecionar_candidato(
-        cnpj_candidatos,
-        normalizar_cnpj,
-        logger,
-        "STEP 2",
-        "CNPJ",
-    )
-    site, site_escolhido = selecionar_candidato(
-        extrair_lista(objeto, "site"),
-        normalizar_url,
-        logger,
-        "STEP 2",
-        "site",
-    )
-    nome_oficial = normalizar_nome(objeto.get("nome_oficial", dados["nome_escola"]))
     confirmada = objeto.get("identidade_confirmada", False)
     if isinstance(confirmada, str):
         confirmada = confirmada.strip().lower() in {"true", "sim", "yes", "1", "confirmada"}
-    justificativa = normalizar_valor_generico(objeto.get("justificativa_identidade", ""))
-    resultado = {
-        "identidade_confirmada": bool(confirmada),
-        "nome_oficial": nome_oficial,
-        "razao_social": razao_social,
-        "cnpj": cnpj,
-        "site": site,
-        "justificativa": justificativa,
-        "conflitos": lista_segura(objeto.get("conflitos", [])),
-        "selecoes": {
-            "razao_social": razao_escolhida,
-            "cnpj": cnpj_escolhido,
-            "site": site_escolhido,
-        },
-    }
-    logger.info(
-        "STEP 2",
-        "Identidade validada." if resultado["identidade_confirmada"] else "Identidade não confirmada com segurança.",
-    )
-    return resultado
-
+    confirmada = bool(confirmada) and identidade_compativel(dados, objeto)
+    if not confirmada:
+        logger.erro("STEP 2", "Identidade não confirmada; nenhum dado externo será aceito.")
+        return {"identidade_confirmada": False, "nome_oficial": dados["nome_escola"], "razao_social": VALOR_NAO_IDENTIFICADO, "cnpj": VALOR_NAO_IDENTIFICADO, "site": VALOR_NAO_IDENTIFICADO, "justificativa": normalizar_valor_generico(objeto.get("justificativa_identidade", "")), "conflitos": lista_segura(objeto.get("conflitos", [])), "selecoes": {}}
+    fontes = pesquisa.get("fontes", [])
+    razao = filtrar_candidatos_com_prova(extrair_lista(objeto, "razao_social"), fontes, logger, "STEP 2", "razão social")
+    cnpjs = filtrar_candidatos_com_prova(extrair_lista(objeto, "cnpj"), fontes, logger, "STEP 2", "CNPJ")
+    sites = filtrar_candidatos_com_prova(extrair_lista(objeto, "site"), fontes, logger, "STEP 2", "site")
+    razao_social, razao_escolhida = selecionar_candidato(razao, normalizar_valor_generico, logger, "STEP 2", "razão social")
+    cnpj, cnpj_escolhido = selecionar_candidato(cnpjs, normalizar_cnpj, logger, "STEP 2", "CNPJ")
+    site, site_escolhido = selecionar_candidato(sites, normalizar_url, logger, "STEP 2", "site")
+    logger.info("STEP 2", "Identidade confirmada e candidatos validados por fonte.")
+    return {"identidade_confirmada": True, "nome_oficial": normalizar_nome(objeto.get("nome_oficial", dados["nome_escola"])), "razao_social": razao_social, "cnpj": cnpj, "site": site, "justificativa": normalizar_valor_generico(objeto.get("justificativa_identidade", "")), "conflitos": lista_segura(objeto.get("conflitos", [])), "selecoes": {"razao_social": razao_escolhida, "cnpj": cnpj_escolhido, "site": site_escolhido}}
 
 def step_3_extracao(dados, pesquisa, identidade, logger):
     logger.info("STEP 3", "Extração de contatos iniciada.")
-    objeto = pesquisa.get("research", {})
-    telefone_candidatos = preparar_candidatos(extrair_lista(objeto, "telefone_alternativo"))
-    email_candidatos = preparar_candidatos(extrair_lista(objeto, "email"))
-    if not telefone_candidatos:
-        telefone_candidatos = extrair_telefones_evidencias(pesquisa.get("evidencias", ""))
-    if not email_candidatos:
-        email_candidatos = extrair_emails_evidencias(pesquisa.get("evidencias", ""))
-    diretor, diretor_escolhido = selecionar_candidato(
-        extrair_lista(objeto, "diretor"),
-        validar_diretor,
-        logger,
-        "STEP 3",
-        "diretor",
-    )
-    telefone, telefone_escolhido = selecionar_candidato(
-        telefone_candidatos,
-        normalizar_telefone,
-        logger,
-        "STEP 3",
-        "telefone",
-    )
-    email, email_escolhido = selecionar_candidato(
-        email_candidatos,
-        normalizar_email,
-        logger,
-        "STEP 3",
-        "e-mail",
-    )
-    resultado = {
-        "diretor": diretor,
-        "telefone_alternativo": telefone,
-        "email": email,
-        "observacoes": normalizar_valor_generico(objeto.get("observacoes", "")),
-        "selecoes": {
-            "diretor": diretor_escolhido,
-            "telefone_alternativo": telefone_escolhido,
-            "email": email_escolhido,
-        },
-    }
-    logger.info("STEP 3", "Extração concluída.")
-    return resultado
-
+    if not identidade.get("identidade_confirmada"):
+        return {"diretor": VALOR_NAO_IDENTIFICADO, "telefone_alternativo": VALOR_NAO_IDENTIFICADO, "email": VALOR_NAO_IDENTIFICADO, "observacoes": VALOR_NAO_IDENTIFICADO, "selecoes": {}}
+    objeto, fontes = pesquisa.get("research", {}), pesquisa.get("fontes", [])
+    diretores = filtrar_candidatos_com_prova(extrair_lista(objeto, "diretor"), fontes, logger, "STEP 3", "diretor")
+    socios = filtrar_candidatos_com_prova(extrair_lista(objeto, "socio_mantenedor"), fontes, logger, "STEP 3", "sócio/mantenedor")
+    telefones = filtrar_candidatos_com_prova(extrair_lista(objeto, "telefone_alternativo"), fontes, logger, "STEP 3", "telefone")
+    emails = filtrar_candidatos_com_prova(extrair_lista(objeto, "email"), fontes, logger, "STEP 3", "e-mail")
+    diretor, diretor_escolhido = selecionar_candidato(diretores, validar_diretor, logger, "STEP 3", "diretor")
+    telefone, telefone_escolhido = selecionar_candidato(telefones, normalizar_telefone, logger, "STEP 3", "telefone")
+    email, email_escolhido = selecionar_candidato(emails, normalizar_email, logger, "STEP 3", "e-mail")
+    nomes_socios = [normalizar_valor_generico(x.get("valor", "")) for x in socios]
+    nomes_socios = [x for x in nomes_socios if x != VALOR_NAO_IDENTIFICADO]
+    observacoes = normalizar_valor_generico(objeto.get("observacoes", ""))
+    if nomes_socios:
+        observacoes = juntar_observacoes(observacoes, "Sócio/mantenedor identificado: " + "; ".join(dict.fromkeys(nomes_socios)))
+    logger.info("STEP 3", "Extração concluída com validação de evidências.")
+    return {"diretor": diretor, "telefone_alternativo": telefone, "email": email, "observacoes": observacoes, "selecoes": {"diretor": diretor_escolhido, "telefone_alternativo": telefone_escolhido, "email": email_escolhido, "socio_mantenedor": socios}}
 
 def step_4_tecnologia(dados, pesquisa, identidade, extracao, logger):
     logger.info("STEP 4", "Análise de tecnologia iniciada.")
-    objeto = pesquisa.get("research", {})
-    sge, sge_escolhido = selecionar_candidato(
-        extrair_lista(objeto, "sge_atual"),
-        normalizar_valor_generico,
-        logger,
-        "STEP 4",
-        "SGE",
-    )
-    agenda, agenda_escolhida = selecionar_candidato(
-        extrair_lista(objeto, "agenda_digital"),
-        normalizar_valor_generico,
-        logger,
-        "STEP 4",
-        "Agenda Digital",
-    )
-    resultado = {
-        "sge_atual": sge,
-        "agenda_digital": agenda,
-        "observacoes_tecnologia": normalizar_valor_generico(
-            objeto.get("observacoes_tecnologia", "")
-        ),
-        "selecoes": {
-            "sge_atual": sge_escolhido,
-            "agenda_digital": agenda_escolhida,
-        },
-    }
-    logger.info("STEP 4", "Análise de tecnologia concluída.")
-    return resultado
-
+    if not identidade.get("identidade_confirmada"):
+        return {"sge_atual": VALOR_NAO_IDENTIFICADO, "agenda_digital": VALOR_NAO_IDENTIFICADO, "observacoes_tecnologia": VALOR_NAO_IDENTIFICADO, "selecoes": {}}
+    objeto, fontes = pesquisa.get("research", {}), pesquisa.get("fontes", [])
+    sges = filtrar_candidatos_com_prova(extrair_lista(objeto, "sge_atual"), fontes, logger, "STEP 4", "SGE")
+    agendas = filtrar_candidatos_com_prova(extrair_lista(objeto, "agenda_digital"), fontes, logger, "STEP 4", "Agenda Digital")
+    sge, sge_escolhido = selecionar_candidato(sges, normalizar_valor_generico, logger, "STEP 4", "SGE")
+    agenda, agenda_escolhida = selecionar_candidato(agendas, normalizar_valor_generico, logger, "STEP 4", "Agenda Digital")
+    logger.info("STEP 4", "Análise de tecnologia concluída com validação de evidências.")
+    return {"sge_atual": sge, "agenda_digital": agenda, "observacoes_tecnologia": normalizar_valor_generico(objeto.get("observacoes_tecnologia", "")), "selecoes": {"sge_atual": sge_escolhido, "agenda_digital": agenda_escolhida}}
 
 def calcular_score_proesc(dados):
     return min(
@@ -1374,6 +1325,154 @@ def buscar_leads_rodada(supabase, rodada_id):
     return lista_segura(objeto_para_dict(resposta).get("data", []))
 
 
+def valor_exportacao(valor):
+    if valor is None:
+        return ""
+    if isinstance(valor, float) and math.isnan(valor):
+        return ""
+    if isinstance(valor, (dict, list, tuple, set)):
+        return serializar_json(valor)
+    texto = texto_seguro(valor)
+    if texto.lower() in VALORES_VAZIOS:
+        return "Não identificado"
+    return texto
+
+
+def limpar_observacoes_exportacao(valor):
+    texto = valor_exportacao(valor)
+    if "AUDITORIA:" in texto:
+        texto = texto.split("AUDITORIA:", 1)[0].rstrip(" |")
+    return texto or "Não identificado"
+
+
+def preparar_dataframe_exportacao(leads):
+    registros = []
+    for lead in leads:
+        item = objeto_para_dict(lead)
+        registros.append(
+            {
+                "Escola": valor_exportacao(item.get("nome_escola")),
+                "UF": valor_exportacao(item.get("uf")),
+                "Município": valor_exportacao(item.get("municipio")),
+                "Porte": valor_exportacao(item.get("porte", "")),
+                "Endereço": valor_exportacao(item.get("endereco", item.get("endereço", ""))),
+                "Tel. INEP": valor_exportacao(item.get("telefone_inep")),
+                "CNPJ": valor_exportacao(item.get("cnpj")),
+                "Razão Social": valor_exportacao(item.get("razao_social")),
+                "Diretor / Responsável": valor_exportacao(
+                    item.get("diretor", item.get("responsavel", item.get("socio_mantenedor", "")))
+                ),
+                "Tel. Alternativo": valor_exportacao(item.get("telefone_alternativo")),
+                "E-mail": valor_exportacao(item.get("email")),
+                "SGE Atual": valor_exportacao(item.get("sge_atual")),
+                "Agenda Digital": valor_exportacao(item.get("agenda_digital")),
+                "Site": valor_exportacao(item.get("site")),
+                "Observações BDR": limpar_observacoes_exportacao(item.get("observacoes")),
+            }
+        )
+    return pd.DataFrame(
+        registros,
+        columns=[
+            "Escola",
+            "UF",
+            "Município",
+            "Porte",
+            "Endereço",
+            "Tel. INEP",
+            "CNPJ",
+            "Razão Social",
+            "Diretor / Responsável",
+            "Tel. Alternativo",
+            "E-mail",
+            "SGE Atual",
+            "Agenda Digital",
+            "Site",
+            "Observações BDR",
+        ],
+    )
+
+
+def gerar_excel_resultados(leads):
+    df_exportacao = preparar_dataframe_exportacao(leads)
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Enriquecimento LDR"
+
+    verde_escuro = "004225"
+    verde_claro = "EAF5E4"
+    borda_clara = "D9E5D3"
+    branco = "FFFFFF"
+    cinza_texto = "333333"
+    borda = Border(
+        left=Side(style="thin", color=borda_clara),
+        right=Side(style="thin", color=borda_clara),
+        top=Side(style="thin", color=borda_clara),
+        bottom=Side(style="thin", color=borda_clara),
+    )
+
+    for coluna, cabecalho in enumerate(df_exportacao.columns, start=1):
+        celula = worksheet.cell(row=1, column=coluna, value=cabecalho)
+        celula.fill = PatternFill("solid", fgColor=verde_escuro)
+        celula.font = Font(color=branco, bold=True, size=11)
+        celula.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        celula.border = borda
+
+    for linha, valores in enumerate(df_exportacao.itertuples(index=False, name=None), start=2):
+        for coluna, valor in enumerate(valores, start=1):
+            celula = worksheet.cell(row=linha, column=coluna, value=valor)
+            celula.font = Font(color=cinza_texto, size=10)
+            celula.alignment = Alignment(vertical="top", wrap_text=True)
+            celula.border = borda
+            if linha % 2 == 0:
+                celula.fill = PatternFill("solid", fgColor=verde_claro)
+            if coluna in {6, 7, 10}:
+                celula.number_format = "@"
+
+    worksheet.freeze_panes = "A2"
+    worksheet.auto_filter.ref = f"A1:O{max(1, worksheet.max_row)}"
+    worksheet.row_dimensions[1].height = 34
+    for linha in range(2, worksheet.max_row + 1):
+        worksheet.row_dimensions[linha].height = 48
+
+    larguras = {
+        "A": 30,
+        "B": 8,
+        "C": 22,
+        "D": 14,
+        "E": 36,
+        "F": 18,
+        "G": 20,
+        "H": 32,
+        "I": 28,
+        "J": 18,
+        "K": 30,
+        "L": 22,
+        "M": 22,
+        "N": 34,
+        "O": 60,
+    }
+    for coluna, largura in larguras.items():
+        worksheet.column_dimensions[coluna].width = largura
+
+    if worksheet.max_row >= 2:
+        tabela = Table(displayName="TabelaEnriquecimentoLDR", ref=f"A1:O{worksheet.max_row}")
+        estilo = TableStyleInfo(
+            name="TableStyleMedium4",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=False,
+            showColumnStripes=False,
+        )
+        tabela.tableStyleInfo = estilo
+        worksheet.add_table(tabela)
+
+    worksheet.sheet_view.showGridLines = False
+    buffer = BytesIO()
+    workbook.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue(), df_exportacao
+
+
 st.title("🌿 Agente LDR Enterprise - Proesc v5")
 st.sidebar.caption(f"Build ativo: {BUILD_ID}")
 
@@ -1599,29 +1698,13 @@ with tab4:
                 try:
                     leads_db = buscar_leads_rodada(supabase, rodada.get("id"))
                     if leads_db:
-                        res_df = pd.DataFrame(leads_db)
-                        cols = [
-                            "confianca",
-                            "status",
-                            "nome_escola",
-                            "sge_atual",
-                            "agenda_digital",
-                            "diretor",
-                            "telefone_alternativo",
-                            "email",
-                            "cnpj",
-                            "site",
-                            "tempo_gasto",
-                            "modelo_utilizado",
-                            "erro",
-                        ]
-                        cols_existentes = [coluna for coluna in cols if coluna in res_df.columns]
-                        st.dataframe(res_df[cols_existentes], use_container_width=True)
+                        excel_bytes, df_exportacao = gerar_excel_resultados(leads_db)
+                        st.dataframe(df_exportacao, use_container_width=True, hide_index=True)
                         st.download_button(
-                            "📥 Baixar CSV",
-                            res_df.to_csv(index=False).encode("utf-8-sig"),
-                            f"ldr_{rodada.get('id')}.csv",
-                            mime="text/csv",
+                            "📥 Baixar Excel",
+                            excel_bytes,
+                            f"remessa_ldr_proesc_{data_exibicao[:10]}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             key=f"download_{rodada.get('id')}",
                         )
                     else:
